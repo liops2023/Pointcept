@@ -384,11 +384,82 @@ class GridPooling(PointModule):
         self.shuffle_orders = shuffle_orders
         self.traceable = traceable
 
-        self.proj = nn.Linear(in_channels, out_channels)
+        self.proj = nn.Sequential(
+            nn.Linear(in_channels, out_channels),
+            nn.GELU(),
+            nn.Linear(out_channels, out_channels),
+            nn.GELU(),
+            nn.Linear(out_channels, out_channels),
+            nn.GELU(),
+            nn.Linear(out_channels, out_channels),
+        )
+        
+        self.proj_rot = nn.Linear(9, out_channels)
         if norm_layer is not None:
             self.norm = PointSequential(norm_layer(out_channels))
         if act_layer is not None:
             self.act = PointSequential(act_layer())
+
+
+    def scatter_content_orientation(points, cluster, count):
+        """
+        points: (N, 3)  - 전체 점 클라우드 좌표
+        cluster: (N,)   - 각 점이 속한 클러스터 인덱스 [0..M-1]
+        count: (M,)     - 각 클러스터의 점 개수
+
+        returns:
+        canonical: (N,3)    - 각 점을 해당 클러스터 PCA 기준으로 회전 정렬한 좌표
+        R: (M,3,3)          - 각 클러스터별 회전행렬
+        mean_xyz: (M,3)     - 각 클러스터별 평균
+        """
+
+        N, C = points.shape
+        assert C == 3, "여기서는 3D만 가정"
+
+        # 1) 클러스터별 (x,y,z) 합과 개수
+        sum_xyz = torch_scatter.segment_csr(points, cluster, reduce="sum")         # (M,3)
+
+        # 2) 클러스터별 평균
+        #   count==0인 셀이 있으면 나눗셈 문제 -> clamp_min
+        mean_xyz = sum_xyz / count.unsqueeze(-1).clamp_min(1e-9)  # (M,3)
+
+        # 3) 각 점에서 해당 클러스터의 평균을 빼서 중심화
+        #   (N,3) - (N,3) shape (indexing by cluster)
+        centered = points - mean_xyz[cluster]  # (N,3)
+
+        # 4) 각 클러스터별 (x-μ)⊗(x-μ) 누적합 -> 공분산 행렬 만들기
+        #   outer product => (N,3,3)
+        #   => flatten (N,9) => scatter sum -> (M,9) => reshape => (M,3,3)
+        p_outer = centered.unsqueeze(2) * centered.unsqueeze(1)   # shape (N,3,3)
+        p_outer_flat = p_outer.reshape(-1, 9)                     # (N,9)
+        sum_xx_flat = torch_scatter.segment_csr(p_outer_flat, cluster, reduce="sum")          # (M,9)
+        sum_xx = sum_xx_flat.reshape(-1, 3, 3)                    # (M,3,3)
+
+        # 5) 공분산 Cov[i] = (1/count_i)*sum_xx[i]
+        Cov = sum_xx / count.view(-1,1,1).clamp_min(1e-9)  # (M,3,3)
+
+        # 6) SVD => 회전행렬(주성분)
+        #   Cov가 실대칭 행렬이므로 U == V,  ~> U*S*U^T
+        U,S,Vt = torch.linalg.svd(Cov, full_matrices=True)
+        # PCA용으론 보통 U를 고유벡터로 쓴다 (혹은 V)
+        R = U.clone()
+
+        # 만약 det(R)<0인 클러스터는 마지막 축 방향을 뒤집어서 +1로 만든다(오른손좌표계 보정)
+        dets = torch.det(R)
+        negative_mask = (dets < 0)
+        if negative_mask.any():
+            # R[negative_mask,:,2] *= -1  # z축 flip 예시
+            # 또는 R[negative_mask,:,-1] ...
+            # 아래는 R[:, :, 2]에서 2가 '마지막 축'임
+            R[negative_mask, :, 2] *= -1.
+
+        # 7) 최종 canonical 좌표
+        #   canonical[i] = centered[i] @ R[ cluster[i] ].T
+        #   => batch 연산으로 가능
+        R_cluster = R[cluster]                 # (N,3,3)
+        canonical = torch.einsum('nc,ncd->nd', centered, R_cluster.transpose(-1,-2))
+
+        return canonical, R, mean_xyz
 
     def forward(self, point: Point):
         if "grid_coord" in point.keys():
@@ -403,6 +474,7 @@ class GridPooling(PointModule):
             raise AssertionError(
                 "[gird_coord] or [coord, grid_size] should be include in the Point"
             )
+
         grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc")
         grid_coord = grid_coord | point.batch.view(-1, 1) << 48
         grid_coord, cluster, counts = torch.unique(
@@ -411,7 +483,10 @@ class GridPooling(PointModule):
             return_inverse=True,
             return_counts=True,
             dim=0,
-        )
+        ) # cluster: (N,) - return_inverse=True, unique_grid_coord[cluster] = grid_coord
+        # counts: (M,) - 각 클러스터의 개수
+        # grid_coord: (M, 4) - 유일한 그리드 좌표
+
         grid_coord = grid_coord & ((1 << 48) - 1)
         # indices of point sorted by cluster, for torch_scatter.segment_csr
         _, indices = torch.sort(cluster)
@@ -419,10 +494,12 @@ class GridPooling(PointModule):
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         # head_indices of each cluster, for reduce attr e.g. code, batch
         head_indices = indices[idx_ptr[:-1]]
+
+        canonical, R, mean_xyz = self.scatter_content_orientation(point.coord, cluster, counts) 
+        canonical = self.proj(canonical)[indices]
+        
         point_dict = Dict(
-            feat=torch_scatter.segment_csr(
-                self.proj(point.feat)[indices], idx_ptr, reduce=self.reduce
-            ),
+            feat=torch_scatter.segment_csr(self.proj(canonical), idx_ptr, reduce=self.reduce) + self.proj_rot(R.reshape(-1, 9)),
             coord=torch_scatter.segment_csr(
                 point.coord[indices], idx_ptr, reduce="mean"
             ),
